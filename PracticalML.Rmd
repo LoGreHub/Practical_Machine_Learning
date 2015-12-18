@@ -1,0 +1,264 @@
+---
+title: "Prediction assignment writeup"
+author: "Lorenzo Greggio"
+date: "december 2015"
+output: 
+    html_document: 
+        keep_md: true
+---
+## Assignment description
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website [here](http://groupware.les.inf.puc-rio.br/har) (see the section on the Weight Lifting Exercise Dataset).  
+The goal of your project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. You may use any of the other variables to predict with. You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases.
+
+###Data
+[Train set](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)  
+
+[Test set](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+## Reading data
+
+I first read both training and test sets and check dimensions on both, assuming files have already been downloaded and placed in current working directory:
+```{r}
+origTraining = read.csv("pml-training.csv",
+                        na.strings = c("NA","#DIV/0!"),
+                        stringsAsFactors = FALSE)
+origTesting = read.csv("pml-testing.csv",
+                        na.strings = c("NA","#DIV/0!"),
+                        stringsAsFactors = FALSE)
+dim(origTraining);dim(origTesting)
+```
+
+
+We initially have 159 potential predictors and one target variable for classification. Since I'll be using cross validation to estimate out of sample performance of classification algorithms I'm not going to create any partition out of the original training set.
+
+## Picking predictors  
+
+As a first step I focus on removing predictors with high NA rates. I calculate NA rate for every variable in the training set.
+
+```{r}
+NArates = apply(origTraining,2,
+                function(x){mean(is.na(x))})
+data.frame(table(NArates))
+```
+Notice we have several predictors with very high NA rates. 
+I decide to hold only predictors with NA rate being 0, applying variable cuts both on training and testing set.  
+
+
+```{r}
+hold = which(NArates==0)
+training = origTraining[,hold]
+testing = origTesting[,hold]
+```
+
+I then move to consider variables contained in the first 7 columns.
+
+```{r}
+head(training[,1:7])
+```
+
+These are descriptive non-measurement variables which would be hardly useful in assessing exercise quality (please refer to **appendix** for further discussion around these variables). I choose to remove all of them, applying variable cuts both on training and testing set.
+
+```{r}
+remove = 1:7
+training = training[,-remove]
+testing = testing[,-remove]
+```
+
+Last, I perform a check for *nearZeroVariance* variables in order to spot uninformative predictors, if any.
+
+```{r}
+library(caret)
+nzv = nearZeroVar(training[,-ncol(training)],saveMetrics=TRUE)
+sum(nzv$nzv)
+```
+
+None of the retained predictors have been flagged as being *nearZeroVariance* variables, so there's no need to drop any of those.  
+Let's check which are the predictors that made it into the final training set after all cuts:
+
+```{r}
+names(training)
+```
+
+We are left with 52 predictors (which happen to be the original 9x each sensor measurements plus the calculated Euler's angles and total acceleration for each sensor) plus the target *classe* variable.  
+
+## Some data exploration 
+
+In order to grab a sense of how sensor measurements differ by activity quality, I plot median predictor values after summarising them per *classe* variable and converting resulting dataframe to long format with `reshape2` package (main reason for this is to group predictors per sensor type).  
+
+
+```{r message=FALSE}
+library(dplyr)
+d = tbl_df(training)
+med = d%>%group_by(classe)%>%summarise_each(funs(median))
+library(reshape2)
+molten= melt(data.frame(med),id.vars="classe",value.name="median")
+molten$sensorType=rep(c("belt","arm","dumbbell","forearm (glove)"),each=65)
+
+g = ggplot(aes(y=variable,x=median,color=classe),data=molten)
+g + geom_point(size=4) + 
+    facet_wrap(~sensorType,scales="free",ncol=2) +
+    theme(axis.title.y=element_blank()) +
+    labs(title="Median predictor values by activity quality")
+```
+  
+    
+Notice how well median values of *magnet_arm_x* represent different activity quality and, on the other hand, how poorly gyroscope median measurement across all axis and sensors discrimininate between *classe* values.  
+
+When coming to explore variance, I run PCA on my predictors.  
+
+```{r}
+myPCA = prcomp(training[,-ncol(training)],center=TRUE,scale.=TRUE)
+(myPCA$sdev^2/sum(myPCA$sdev^2))[1:2]
+```
+First 2 principal components account only for roughly 31% of total variance, but plotting their loadings gives us a view of which are the measurements which mostly drives them. Coloring by sensor type should give some insights regarding which sensors rule the first 2 principal components.  
+
+```{r}
+PCAdf=data.frame(myPCA$rotation)
+PCAdf$sensorType=rep(c("belt","arm","dumbbell","forearm (glove)"),each=13)
+g = ggplot(aes(x=PC1,y=PC2,color=sensorType),data=PCAdf)
+g + geom_point(size=10,alpha=.8) + 
+    labs(title="PCA - first 2 components (31% of total variance)")
+```
+
+We notice how heaviest (both positive and negative) loadings on first 2 principal components come from belt sensor, with dumbbell measurements coming second and being particularly prominent on the negative side of both the principal components.  
+This of course only relates to variance explanation and doesn't imply those variables will have better predicting power.  
+
+PCA has been used only as an exploratory technique, prediction tasks will be based on original variables.  
+
+
+## Fitting a random forest model  
+
+Planning to fit a random forest model, I check for class proportion in *classe* target variable.  
+
+```{r}
+prop.table(table(training$classe))
+```
+
+Even though there seems to be some unbalancing towards the A class, it doesn't look as severe as requiring to throw in any resampling adjustments to correct class imbalance.  
+Next, I setup R to allow parallel computation.  
+
+
+```{r}
+library(doParallel) #running on Windows 7
+cl = makeCluster(detectCores()) # check results from detectCores() as it could fail correct detection
+registerDoParallel(cl)
+```
+
+I plan to fit the model through `train` function available in `caret` package.  
+Random forest model has only one tuning parameter, namely *mtry*, defining the number of random predictors which will be available for each tree at each split. I create a dataframe containing the candidate values for the parameter which will be passed later to the `train` function.  
+Having 52 predictors, here's how I pick candidate values:  
+
+- very small number (2)  
+
+- floor of square root of number of predictors (7)  
+
+- .5 * number of predictors (27)  
+
+- .75 * number of predictors (39)  
+
+- number of predictors (52), this option being the same as using a **bagging** algorithm with all predictors always available for tree splits.  
+
+```{r}
+tGrid = data.frame(mtry=c(2,7,27,39,52))
+```
+
+
+Next I define how to control the training function:  
+```{r}
+resControl = trainControl(method="cv",
+                          number=10,
+                          returnResamp = "all" #might be useful for further investigation
+                         )
+```
+
+I will use **10-fold cross validation to estimate out-of-sample accuracy** of the model.   
+5 different random forests models will be fitted (one for each *mtry* candidate value I specified earlier) and **accuracy** will be evaluated for each model through cross-validation. The most accurate model between the five will be then chosen and refitted with the full training set, ready to be used to make predictions on new data.   
+
+Since I'm using parallel computation this is where I should specify the *seeds* option (setting seed normally with *set.seed()* won't work with parallel computation) to guarantee full reproducibility of code. It is somehow a more complex procedure which I'm not familiar with yet, so I'm not going deeper into it right now.  
+
+
+I am now ready to fit the model, avoding use of *formula* method and accepting defaults for maximizing accuracy, as well as default value of 500 trees per forest in the internal call to *randomForest*. 
+```{r message=FALSE,cache=TRUE}
+library(randomForest)
+rfFit = train(y=training$classe,
+              x=training[,-ncol(training)],
+              method="rf",
+              tuneGrid=tGrid,
+              trControl=resControl)
+```
+
+After stopping the cluster for parallel computation, we have a look at results:
+```{r }
+stopCluster(cl)
+rfFit
+```
+Best model (accuracy-wise) results in being the one built with *mtry* = 7.  
+
+Cross-validation estimated **expected out of sample error** for best model is then 
+```{r }
+(1-rfFit$results$Accuracy[2])*100
+```
+expressed as a percentage.  
+
+Plotting to check for variable importance:  
+
+```{r message=FALSE }
+rfImp = varImp(rfFit)
+plot(rfImp,top=20)
+```
+
+Many (15) of the 20 most important variables come from belt and dumbbell sensors measurements, as we had been hinted by analysis of the first 2 principal components.  
+
+Finally, we are ready to predict activity quality for testing set observations.
+```{r }
+finalPrediction = predict(rfFit,testing)
+```
+
+##Appendix  
+
+### Trivial solution  
+
+
+After reading [documentation of the original study](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) and getting familiar with data generating process, it is easy to see how the data was collected.
+
+```{r}
+table(origTraining$cvtd_timestamp,origTraining$user_name)
+```
+
+Users were monitored within different 3 to 4 minutes time frames (dates are not ordered in the table but this is not relevant). Let's focus on Adelmo, for instance, and note his performance was monitored on 02/12/2011 from 13:32 to 13:35. 
+Furthermore, Adelmo performed the exercises sequentially from A to E, as shown in this table.
+
+```{r}
+adelmo=origTraining[origTraining$user_name=="adelmo",]
+table(adelmo$cvtd_timestamp,adelmo$classe)
+```
+
+If you perform the same calculation for the other users, the same pattern will be shown.  
+On this basis, and since we are asked to predict for observations that were contained in the original study dataset (and we are allowed to pick whichever predictors we want), it is trivial to classify the observations using only 1 time based variable, as shown in the plot:
+
+```{r}
+g = ggplot(data=origTraining,aes(x=user_name,y=raw_timestamp_part_1,color=classe))
+g + geom_jitter(position=position_jitter(height=0),size=4) + 
+    geom_jitter(data=origTesting,position=position_jitter(height=0),size=3,alpha=.8,color="black") +
+    theme(axis.text = element_blank()) + 
+    facet_wrap(~user_name,scales="free",nrow=1) + 
+    labs(x="User",y="Time (raw_timestamp_part_1)") + 
+    geom_text(aes(label=X),data=origTesting[-c(1,3,13),],hjust=1,vjust=1,color="white",size=4) +
+    geom_text(aes(label=X),data=origTesting[c(1,3,13),],hjust=-1,vjust=1,color="white",size=4) 
+```
+
+In fact, by constructing a single tree model picking *raw_timestamp_part_1* as the only predictor would accomplish our classification task (code is not evaluated, try it yourself if you wish):
+```{r eval=FALSE}
+library(rpart)
+singleTreeFit = train(classe~raw_timestamp_part_1,
+                      data=origTraining,
+                      method="rpart")
+
+```
+
+Predictions originated by this single tree model would agree 100% both with the plot and the random forest predictions.  
+
+Of course this approach wouldn't work if we had to extrapolate and generalize beyond the time intervals in the original dataset (**and this motivates the exclusion of first 7 variables in the training set fed to the random forest classifier**).  
+
+Last, it is my opinion this asssignment has been misconceived, please refer to [this post on the forums](https://class.coursera.org/predmachlearn-035/forum/thread?thread_id=39) for further discussion.  
+
